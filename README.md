@@ -62,7 +62,7 @@
 
 ## 🚀 快速使用 | Quick Start
 
-1. 直接下载仓库中的 [`Monitor.exe`](Monitor.exe) 双击运行即可。
+1. 前往 [GitHub Releases](https://github.com/Foreseer299/Monitor/releases/latest) 下载最新的 `Monitor.exe` 单文件，双击即可运行（无需安装任何运行库）。
 2. 在系统托盘区右键（或左键）点击 Monitor 图标，即可打开全部自定义设置菜单。
 
 ---
@@ -88,10 +88,11 @@ g++ -O2 -s -Wall -Wextra -Wno-unused-parameter -mwindows Monitor.cpp resource.re
 ## 📁 文件结构 | Project Files
 
 - [`Monitor.cpp`](Monitor.cpp) — 全部核心实现（监控采集、Direct2D 渲染、配置持久化、双语托盘菜单）
-- [`Monitor.exe`](Monitor.exe) — 预编译好的独立可执行文件（无需安装运行库）
 - [`app.ico`](app.ico) / [`app.png`](app.png) — 稀疏低多边形风格应用与托盘图标
 - [`resource.rc`](resource.rc) — Windows 图标资源定义
 - [`build.bat`](build.bat) — 一键编译脚本
+
+> 预编译好的单文件可执行程序 `Monitor.exe` 请在 [Releases](https://github.com/Foreseer299/Monitor/releases/latest) 页面下载。
 
 ---
 
