@@ -1,0 +1,9 @@
+*.res
+*.o
+*.obj
+*.pdb
+*.tmp
+*.bak
+*.log
+.vscode/
+.vs/
