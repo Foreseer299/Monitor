@@ -38,6 +38,7 @@ inline FnPtr LoadProc(HMODULE hMod, const char* procName) {
 // -------------------------------------------------------------
 #define WM_TRAYICON (WM_USER + 101)
 #define ID_TIMER_REFRESH 1001
+#define ID_TIMER_TRIM    1002
 
 // 刷新频率
 #define IDM_REFRESH_250   2001
@@ -295,6 +296,31 @@ int g_winPhysW = 260;
 int g_winPhysH = 24;
 int g_posX = 8;
 int g_posY = 6;
+
+// 性能优化状态：脏检测 / 离屏缓存 / 字宽缓存
+UINT64 g_configVersion = 1;
+UINT64 g_fontVersion = 1;
+UINT64 g_lastRenderedConfigVer = 0;
+int g_lastRenderedPhysW = 0;
+int g_lastRenderedPhysH = 0;
+int g_lastRenderedPosX = 0;
+int g_lastRenderedPosY = 0;
+std::wstring g_lastFrameKey;
+
+HDC g_hMemDC = NULL;
+HBITMAP g_hBitmap = NULL;
+HBITMAP g_hOldBitmap = NULL;
+void* g_pBits = NULL;
+int g_dibW = 0;
+int g_dibH = 0;
+
+inline void MarkVisualDirty() {
+    ++g_configVersion;
+}
+
+inline void TrimWorkingSet() {
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
 
 // 前向声明
 void RenderOverlay();
@@ -769,6 +795,8 @@ void UpdateTextFormat() {
             g_pTextFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
     }
+    ++g_fontVersion;
+    MarkVisualDirty();
 }
 
 float MeasureTextWidth(const std::wstring& str) {
@@ -785,6 +813,83 @@ float MeasureTextWidth(const std::wstring& str) {
         return w;
     }
     return (float)str.size() * g_cfg.fontSize * 0.6f;
+}
+
+float GetSlotWidth(MetricType type, const std::wstring& sampleText, const std::wstring& actualText) {
+    static UINT64 s_cacheFontVer = 0;
+    static std::wstring s_sampleStr[8];
+    static float s_sampleW[8] = { 0 };
+
+    if (s_cacheFontVer != g_fontVersion) {
+        for (int i = 0; i < 8; ++i) {
+            s_sampleStr[i].clear();
+            s_sampleW[i] = 0.0f;
+        }
+        s_cacheFontVer = g_fontVersion;
+    }
+
+    int idx = (int)type;
+    float sw = 0.0f;
+    if (idx >= 0 && idx < 8) {
+        if (s_sampleStr[idx] != sampleText) {
+            s_sampleStr[idx] = sampleText;
+            s_sampleW[idx] = MeasureTextWidth(sampleText);
+        }
+        sw = s_sampleW[idx];
+    } else {
+        sw = MeasureTextWidth(sampleText);
+    }
+
+    float aw = (actualText.size() > sampleText.size()) ? MeasureTextWidth(actualText) : 0.0f;
+    return fmaxf(sw, aw) + 2.0f;
+}
+
+void ReleaseBackbuffer() {
+    if (g_hMemDC) {
+        if (g_hOldBitmap) {
+            SelectObject(g_hMemDC, g_hOldBitmap);
+            g_hOldBitmap = NULL;
+        }
+        DeleteDC(g_hMemDC);
+        g_hMemDC = NULL;
+    }
+    if (g_hBitmap) {
+        DeleteObject(g_hBitmap);
+        g_hBitmap = NULL;
+    }
+    g_pBits = NULL;
+    g_dibW = 0;
+    g_dibH = 0;
+}
+
+bool EnsureBackbuffer(int physW, int physH) {
+    if (g_hMemDC && g_hBitmap && g_pBits && g_dibW == physW && g_dibH == physH) {
+        return true;
+    }
+    ReleaseBackbuffer();
+
+    HDC hScreenDC = GetDC(NULL);
+    g_hMemDC = CreateCompatibleDC(hScreenDC);
+    ReleaseDC(NULL, hScreenDC);
+    if (!g_hMemDC) return false;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = physW;
+    bmi.bmiHeader.biHeight = -physH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    g_hBitmap = CreateDIBSection(g_hMemDC, &bmi, DIB_RGB_COLORS, &g_pBits, NULL, 0);
+    if (!g_hBitmap || !g_pBits) {
+        ReleaseBackbuffer();
+        return false;
+    }
+    g_hOldBitmap = (HBITMAP)SelectObject(g_hMemDC, g_hBitmap);
+    g_dibW = physW;
+    g_dibH = physH;
+    return true;
 }
 
 D2D1_COLOR_F ColorFromTheme() {
@@ -1112,14 +1217,16 @@ void RenderOverlay() {
         } else if (!fs && g_hiddenByFullscreen) {
             g_hiddenByFullscreen = false;
             ShowWindow(g_hWnd, SW_SHOWNOACTIVATE);
+            MarkVisualDirty();
         }
         if (g_hiddenByFullscreen) return;
     } else if (g_hiddenByFullscreen) {
         g_hiddenByFullscreen = false;
         ShowWindow(g_hWnd, SW_SHOWNOACTIVATE);
+        MarkVisualDirty();
     }
 
-    std::vector<MetricSlot> slots;
+    static std::vector<MetricSlot> slots;
     BuildMetricSlots(slots);
 
     // 间距参数 (DIP)
@@ -1141,12 +1248,16 @@ void RenderOverlay() {
     float padY = hasBg ? 4.0f : 0.0f;
     float rowH = hasBg ? ceilf(g_cfg.fontSize * 1.50f) : fmaxf(24.0f, ceilf(g_cfg.fontSize * 1.65f));
 
-    // 为每个槽位计算固定最大宽度 (零抖动 + 零裁切)
+    // 为每个槽位计算缓存后的固定最大宽度 (零抖动 + 零重复 COM 测宽)
+    static std::wstring frameKey;
+    frameKey.clear();
     for (size_t i = 0; i < slots.size(); ++i) {
-        float sw = MeasureTextWidth(slots[i].sampleText);
-        float aw = MeasureTextWidth(slots[i].text);
-        slots[i].w = fmaxf(sw, aw) + 2.0f;
+        slots[i].w = GetSlotWidth(slots[i].type, slots[i].sampleText, slots[i].text);
         slots[i].h = rowH;
+        frameKey.append(slots[i].text);
+        frameKey.push_back(L'\t');
+        frameKey.push_back((wchar_t)(L'0' + slots[i].severity));
+        frameKey.push_back(L'|');
     }
 
     float logicalW = 0.0f;
@@ -1212,26 +1323,21 @@ void RenderOverlay() {
         ComputeWindowPosition(physW, physH, g_posX, g_posY);
     }
 
-    HDC hScreenDC = GetDC(NULL);
-    HDC hMemDC = CreateCompatibleDC(hScreenDC);
+    // 脏检测：数值/样式/位置均未变化时直接跳过整帧绘制与合成
+    if (g_configVersion == g_lastRenderedConfigVer &&
+        physW == g_lastRenderedPhysW &&
+        physH == g_lastRenderedPhysH &&
+        g_posX == g_lastRenderedPosX &&
+        g_posY == g_lastRenderedPosY &&
+        frameKey == g_lastFrameKey) {
+        return;
+    }
 
-    BITMAPINFO bmi;
-    memset(&bmi, 0, sizeof(bmi));
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = physW;
-    bmi.bmiHeader.biHeight = -physH;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    if (!EnsureBackbuffer(physW, physH)) return;
+    memset(g_pBits, 0, (size_t)physW * (size_t)physH * 4);
 
-    void* pBits = NULL;
-    HBITMAP hBitmap = CreateDIBSection(hMemDC, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    if (hBitmap && pBits) {
-        HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
-        memset(pBits, 0, (size_t)physW * (size_t)physH * 4);
-
-        RECT rc = { 0, 0, physW, physH };
-        if (SUCCEEDED(g_pDCRenderTarget->BindDC(hMemDC, &rc))) {
+    RECT rc = { 0, 0, physW, physH };
+    if (SUCCEEDED(g_pDCRenderTarget->BindDC(g_hMemDC, &rc))) {
             g_pDCRenderTarget->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
             g_pDCRenderTarget->BeginDraw();
             g_pDCRenderTarget->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
@@ -1330,26 +1436,26 @@ void RenderOverlay() {
             }
 
             g_pDCRenderTarget->EndDraw();
-        }
 
-        POINT ptSrc = { 0, 0 };
-        SIZE sizeWnd = { physW, physH };
-        POINT ptDst = { g_posX, g_posY };
+            POINT ptSrc = { 0, 0 };
+            SIZE sizeWnd = { physW, physH };
+            POINT ptDst = { g_posX, g_posY };
 
-        BLENDFUNCTION blend;
-        blend.BlendOp = AC_SRC_OVER;
-        blend.BlendFlags = 0;
-        blend.SourceConstantAlpha = (BYTE)roundf(255.0f * (g_cfg.opacityPct / 100.0f));
-        blend.AlphaFormat = AC_SRC_ALPHA;
+            BLENDFUNCTION blend;
+            blend.BlendOp = AC_SRC_OVER;
+            blend.BlendFlags = 0;
+            blend.SourceConstantAlpha = (BYTE)roundf(255.0f * (g_cfg.opacityPct / 100.0f));
+            blend.AlphaFormat = AC_SRC_ALPHA;
 
-        UpdateLayeredWindow(g_hWnd, hScreenDC, &ptDst, &sizeWnd, hMemDC, &ptSrc, 0, &blend, ULW_ALPHA);
+            UpdateLayeredWindow(g_hWnd, NULL, &ptDst, &sizeWnd, g_hMemDC, &ptSrc, 0, &blend, ULW_ALPHA);
 
-        SelectObject(hMemDC, hOldBitmap);
-        DeleteObject(hBitmap);
+            g_lastRenderedConfigVer = g_configVersion;
+            g_lastRenderedPhysW = physW;
+            g_lastRenderedPhysH = physH;
+            g_lastRenderedPosX = g_posX;
+            g_lastRenderedPosY = g_posY;
+            g_lastFrameKey = frameKey;
     }
-
-    DeleteDC(hMemDC);
-    ReleaseDC(NULL, hScreenDC);
 }
 
 // -------------------------------------------------------------
@@ -1366,6 +1472,7 @@ void SetDragUnlocked(bool unlock) {
     SetWindowLongPtrW(g_hWnd, GWL_EXSTYLE, ex);
     SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    MarkVisualDirty();
     RenderOverlay();
 }
 
@@ -1408,6 +1515,7 @@ void PickSystemFont() {
         RenderOverlay();
     }
     g_dialogOpen = false;
+    TrimWorkingSet();
 }
 
 void PickCustomColor() {
@@ -1430,10 +1538,12 @@ void PickCustomColor() {
     if (ChooseColorW(&cc)) {
         g_cfg.customColor = cc.rgbResult;
         g_cfg.colorTheme = THEME_CUSTOM;
+        MarkVisualDirty();
         SaveConfig();
         RenderOverlay();
     }
     g_dialogOpen = false;
+    TrimWorkingSet();
 }
 
 // -------------------------------------------------------------
@@ -1668,6 +1778,7 @@ void ShowTrayMenu(HWND hWnd) {
     PostMessageW(hWnd, WM_NULL, 0, 0);
 
     DestroyMenu(hMenu);
+    TrimWorkingSet();
 }
 
 // -------------------------------------------------------------
@@ -1677,20 +1788,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
         SetTimer(hWnd, ID_TIMER_REFRESH, g_cfg.refreshInterval, NULL);
+        SetTimer(hWnd, ID_TIMER_TRIM, 4000, NULL);
         break;
 
     case WM_TIMER:
         if (wParam == ID_TIMER_REFRESH) {
             RenderOverlay();
+        } else if (wParam == ID_TIMER_TRIM) {
+            KillTimer(hWnd, ID_TIMER_TRIM);
+            TrimWorkingSet();
         }
         break;
 
     case WM_DPICHANGED: {
         UINT newDpi = HIWORD(wParam);
         g_dpiScale = (newDpi > 0 ? newDpi : 96) / 96.0f;
+        MarkVisualDirty();
         RenderOverlay();
         break;
     }
+
+    case WM_DISPLAYCHANGE:
+        MarkVisualDirty();
+        RenderOverlay();
+        break;
 
     case WM_LBUTTONDOWN:
         if (g_dragUnlocked) {
@@ -1721,6 +1842,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_cfg.dockPreset = DOCK_CUSTOM;
             g_cfg.customPosX = g_posX;
             g_cfg.customPosY = g_posY;
+            g_lastRenderedPosX = g_posX;
+            g_lastRenderedPosY = g_posY;
             SaveConfig();
         }
         break;
@@ -1867,6 +1990,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowWindow(hWnd, SW_HIDE);
             } else {
                 ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+                MarkVisualDirty();
                 RenderOverlay();
             }
         }
@@ -1884,13 +2008,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         if (needFormat) UpdateTextFormat();
         if (needSave) SaveConfig();
-        if (needRender) RenderOverlay();
+        if (needRender) {
+            MarkVisualDirty();
+            RenderOverlay();
+        }
         break;
     }
 
     case WM_DESTROY:
         KillTimer(hWnd, ID_TIMER_REFRESH);
+        KillTimer(hWnd, ID_TIMER_TRIM);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        ReleaseBackbuffer();
         if (g_nvmlShutdown) {
             g_nvmlShutdown();
         }
